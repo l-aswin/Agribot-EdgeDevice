@@ -1,5 +1,6 @@
 {
   "confidence_threshold": 0.5,
+  "camera_vision_width_cm": 50,
   "server_url": "http://192.168.1.100:5000",
   "command_poll_url": "http://192.168.1.100:5000/api/command",
   "upload_url": "http://192.168.1.100:5000/api/upload",

@@ -113,21 +113,22 @@ class CommandPoller:
     # ------------------------------------------------------------------
 
     def _handle_start(self, payload: dict):
-        travel_distance = float(payload.get("travel_distance", 10.0))
-        logger.info("START command received | travel_distance=%.2f m", travel_distance)
+        travel_distance_cm = float(payload.get("travel_distance_cm", 1000.0))
+        logger.info("START command received | travel_distance=%.1f cm", travel_distance_cm)
 
         with self._seq_lock:
             if self._detection_seq and self._detection_seq.is_running():
                 logger.warning("Detection sequence already running. Ignoring START.")
                 return
             self._detection_seq = WeedDetectionSequence(
-                travel_distance=travel_distance,
+                travel_distance_cm=travel_distance_cm,
                 serial=self.serial,
             )
             self._detection_seq.start()
 
     def _handle_stop(self):
         logger.info("STOP command received.")
+        self.serial.send_stop()
         self._stop_detection()
 
     def _handle_update(self, payload: dict):

@@ -45,13 +45,13 @@ class WeedDetectionSequence:
     Can be stopped safely at any point via stop().
     """
 
-    def __init__(self, travel_distance: float, serial: SerialComm):
+    def __init__(self, travel_distance_cm: float, serial: SerialComm):
         """
         Args:
-            travel_distance: Total distance (meters) to travel while scanning.
-            serial:          Active SerialComm instance for nodeMCU communication.
+            travel_distance_cm: Total distance (cm) to travel while scanning.
+            serial:             Active SerialComm instance for ESP8266 communication.
         """
-        self.travel_distance = travel_distance
+        self.travel_distance = travel_distance_cm
         self.serial = serial
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -73,7 +73,7 @@ class WeedDetectionSequence:
             daemon=True,
         )
         self._thread.start()
-        logger.info("Weed detection sequence started (distance=%.2f m).", self.travel_distance)
+        logger.info("Weed detection sequence started (distance=%.1f cm).", self.travel_distance)
 
     def stop(self):
         """Signal the sequence to stop as soon as possible."""
@@ -235,19 +235,19 @@ class WeedDetectionSequence:
             step_index=step_index,
         )
 
-    def _step6_send_move(self, step_distance: float) -> bool:
-        """Step 6: Send MOVE command to nodeMCU."""
-        logger.info("Step 6: Sending MOVE %.3f m to nodeMCU.", step_distance)
-        return self.serial.send_move_command(step_distance)
+    def _step6_send_move(self, step_distance_cm: float) -> bool:
+        """Step 6: Send FWD command to ESP8266."""
+        logger.info("Step 6: Sending FWD %.1f cm to ESP8266.", step_distance_cm)
+        return self.serial.send_move_command("forward", step_distance_cm)
 
     def _step7_wait_position(self) -> bool:
-        """Step 7: Wait for nodeMCU to confirm position reached."""
-        logger.info("Step 7: Waiting for POSITION_REACHED from nodeMCU...")
-        reached = self.serial.wait_for_position_reached(timeout=120.0)
+        """Step 7: Wait for ESP8266 to confirm movement complete."""
+        logger.info("Step 7: Waiting for DONE from ESP8266...")
+        reached = self.serial.wait_for_done(timeout=120.0)
         if reached:
-            logger.info("Step 7: Position reached.")
+            logger.info("Step 7: Movement complete.")
         else:
-            logger.warning("Step 7: Timed out waiting for POSITION_REACHED.")
+            logger.warning("Step 7: Timed out waiting for DONE.")
         return reached
 
     def _step8_check_complete(
@@ -264,14 +264,14 @@ class WeedDetectionSequence:
         self._load_model()
 
         save_dir = self._ensure_save_dir()
-        step_distance = 1.0          # Move 1 m per iteration (adjust as needed)
+        step_distance = float(settings.get("camera_vision_width_cm", 50.0))
         distance_covered = 0.0
         step_index = 0
 
         while not self._stopped():
             step_index += 1
             capture_id = uuid.uuid4().hex[:12]
-            logger.info("=== Sequence step %d | covered=%.2f/%.2f m ===",
+            logger.info("=== Sequence step %d | covered=%.1f/%.1f cm ===",
                         step_index, distance_covered, self.travel_distance)
 
             # Step 1 – Capture
@@ -323,7 +323,7 @@ class WeedDetectionSequence:
 
             # Step 8 – Check completion
             if self._step8_check_complete(distance_covered):
-                logger.info("Step 8: Total distance covered (%.2f m). Sending COMPLETED.",
+                logger.info("Step 8: Total distance covered (%.1f cm). Sending COMPLETED.",
                             distance_covered)
                 uploader.send_completed(
                     completed_url=settings.get("completed_url"),
