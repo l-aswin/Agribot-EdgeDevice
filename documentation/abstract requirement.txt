@@ -1,0 +1,36 @@
+﻿1. One time boot up actions
+after boot up read settings from local JSON (confidence threshold, device ID, server URL, etc.)
+starts command polling
+
+2. Command polling
+Poll web server every 2 seconds via HTTP
+5 types of command Configuration Management,Manual Control, One-Way Weed Detection, Route-Based Weed Detection, Stop operations	
+
+3. Configuration Management
+Persist updated settings back to JSON when an update_settings command is received.
+load in-memory settings variables from json
+
+4. Manual Control
+Move vehicle forward / backward / turn left / turn right. No weed detection. Triggered by directional commands with distance (m) and turn angle (°).
+
+5. One-Way Weed Detection
+Start weed detection along a straight path. Takes Grid X, Grid Y, and Forward distance (metres) as parameters. Runs the weed detection sequence until total distance is covered
+
+6. Route-Based Weed Detection
+Follow a pre-designed multi-step route (sequence of move forward / turn commands with distances). Runs weed detection at each forward segment.
+
+7. Stop operations	
+Abruptly halt any in-progress sequence (weed detection or movement)
+
+6. Weed Detection Sequence (used in modes 2 & 3)
+
+Step	Action
+1	Capture photo from USB camera, save locally
+2	Run YOLO .pt model for weed inference
+3	Draw bounding boxes on detected weeds, save annotated image
+4	Create JSON with coordinates, class labels, confidence scores
+5	Upload raw image + annotated image + JSON to server; delete local copies
+
+
+
+
