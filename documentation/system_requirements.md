@@ -93,6 +93,27 @@
 - **SR-31:** After Step 5 of each iteration, the device SHALL send a move forward command to the ESP8266 via UART with distance = camera vision width (cm), and wait for acknowledgement before starting the next iteration.
 - **SR-32:** Once all iterations are complete (total distance covered), the device SHALL send a `completed` HTTP request to the web server.
 
+### Flowchart
+
+```mermaid
+flowchart TD
+    A([Start Weed Detection]) --> B["Calculate:\niterations = ceil(forward_distance_cm / camera_vision_width_cm)\ndistance_covered = 0"]
+    B --> D{Stop command\nreceived?}
+    D -- Yes --> Z([Abort — Return to Idle])
+    D -- No --> E["Step 1: Capture photo from USB camera\nSave raw image locally"]
+    E --> F["Step 2: Run YOLO model\nApply confidence threshold"]
+    F --> G["Step 3: Draw bounding boxes\nSave annotated image locally"]
+    G --> H["Step 4: Create detection JSON\ncoordinates, class labels, confidence scores"]
+    H --> I["Step 5: Upload raw image + annotated image + JSON to server\nDelete local copies"]
+    I --> J["Send UART: move forward camera_vision_width cm"]
+    J --> K[Wait for ESP8266 DONE acknowledgement]
+    K --> L["distance_covered += camera_vision_width"]
+    L --> M{"distance_covered\n>= forward_distance?"}
+    M -- No --> D
+    M -- Yes --> N[Send completed HTTP request to web server]
+    N --> O([End])
+```
+
 ---
 
 ## 8. ESP8266 UART Communication
