@@ -16,6 +16,8 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
 import settings
 from command_poller import CommandPoller
@@ -25,13 +27,17 @@ from serial_comm import SerialComm
 # Logging setup
 # ---------------------------------------------------------------------------
 
+_logs_dir = Path("logs")
+_logs_dir.mkdir(exist_ok=True)
+_log_filename = _logs_dir / (datetime.now().strftime("%d-%B-%Y_%I-%M-%S%p").lower() + ".log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    datefmt="%d-%b-%Y %I:%M:%S %p",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("weed_detection.log"),
+        logging.FileHandler(_log_filename),
     ],
 )
 logger = logging.getLogger("main")

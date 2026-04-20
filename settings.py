@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SETTINGS = {
     "confidence_threshold": 0.5,
-    "server_url": "http://192.168.1.100:5000",
+    "api_url": "http://192.168.1.100:5000",
     "command_poll_url": "http://192.168.1.100:5000/api/command",
     "upload_url": "http://192.168.1.100:5000/api/upload",
     "completed_url": "http://192.168.1.100:5000/api/completed",

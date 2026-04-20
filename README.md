@@ -42,7 +42,7 @@ Update the server URLs and serial port to match your environment:
 
 ```json
 {
-  "server_url":        "http://<server-ip>:5000",
+  "api_url":           "http://<server-ip>:5000",
   "command_poll_url":  "http://<server-ip>:5000/api/command",
   "upload_url":        "http://<server-ip>:5000/api/upload",
   "completed_url":     "http://<server-ip>:5000/api/completed",
