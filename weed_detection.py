@@ -33,10 +33,9 @@ logger = logging.getLogger(__name__)
 
 try:
     from ultralytics import YOLO
-    YOLO_AVAILABLE = True
 except ImportError:
-    logger.warning("ultralytics not installed. YOLO inference will be simulated.")
-    YOLO_AVAILABLE = False
+    logger.error("ultralytics package not installed. Install it with: pip install ultralytics")
+    sys.exit(1)
 
 
 class WeedDetectionSequence:
@@ -97,13 +96,13 @@ class WeedDetectionSequence:
     def _load_model(self):
         """Load (or reload) the YOLO model."""
         model_path = settings.get("yolo_model_path", "yolo.pt")
-        if YOLO_AVAILABLE:
-            logger.info("Loading YOLO model from %s ...", model_path)
+        logger.info("Loading YOLO model from %s ...", model_path)
+        try:
             self._model = YOLO(model_path)
             logger.info("YOLO model loaded.")
-        else:
-            self._model = None
-            logger.info("[SIMULATED] YOLO model placeholder loaded.")
+        except Exception as e:
+            logger.error("Failed to load YOLO model from '%s': %s", model_path, e)
+            sys.exit(1)
 
     def _ensure_save_dir(self) -> Path:
         save_dir = Path(settings.get("image_save_dir", "/tmp/weed_captures"))
@@ -118,14 +117,6 @@ class WeedDetectionSequence:
         """Step 1: Capture a photo from the USB camera."""
         cam_index = settings.get("camera_index", 0)
         raw_path = str(save_dir / f"{capture_id}_raw.jpg")
-
-        if not YOLO_AVAILABLE:
-            # Simulate: create a blank image
-            import numpy as np
-            blank = (np.zeros((480, 640, 3), dtype="uint8") + 100).astype("uint8")
-            cv2.imwrite(raw_path, blank)
-            logger.info("[SIMULATED] Step 1: Fake image saved to %s", raw_path)
-            return raw_path
 
         cap = cv2.VideoCapture(cam_index)
         if not cap.isOpened():
@@ -143,18 +134,6 @@ class WeedDetectionSequence:
     def _step2_detect(self, raw_image_path: str) -> List[dict]:
         """Step 2: Run YOLO model and return list of detection dicts."""
         confidence_threshold = settings.get("confidence_threshold", 0.5)
-
-        if not YOLO_AVAILABLE or self._model is None:
-            # Simulate detections
-            detections = [
-                {
-                    "class_label": "weed",
-                    "confidence": 0.87,
-                    "bbox": {"x1": 100, "y1": 150, "x2": 250, "y2": 300},
-                }
-            ]
-            logger.info("[SIMULATED] Step 2: %d detections returned.", len(detections))
-            return detections
 
         frame = cv2.imread(raw_image_path)
         results = self._model.predict(frame, conf=confidence_threshold, verbose=False)

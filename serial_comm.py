@@ -19,6 +19,7 @@ Responses (ESP8266 → Jetson Nano):
 """
 
 import logging
+import sys
 import threading
 import time
 from typing import Optional
@@ -27,10 +28,9 @@ logger = logging.getLogger(__name__)
 
 try:
     import serial
-    SERIAL_AVAILABLE = True
 except ImportError:
-    logger.warning("pyserial not installed. Serial communication will be simulated.")
-    SERIAL_AVAILABLE = False
+    logger.error("pyserial package not installed. Install it with: pip install pyserial")
+    sys.exit(1)
 
 
 class SerialComm:
@@ -57,9 +57,6 @@ class SerialComm:
 
     def connect(self) -> bool:
         """Open the serial port."""
-        if not SERIAL_AVAILABLE:
-            logger.info("[SIMULATED] Serial connected to %s @ %d baud", self.port, self.baud)
-            return True
         try:
             self._serial = serial.Serial(
                 self.port, self.baud,
@@ -80,9 +77,6 @@ class SerialComm:
 
     def _write(self, frame: str) -> bool:
         """Send a raw frame string. Caller must hold _lock."""
-        if not SERIAL_AVAILABLE:
-            logger.info("[SIMULATED] Serial TX: %s", frame.strip())
-            return True
         if not self._serial or not self._serial.is_open:
             logger.error("Serial port not open.")
             return False
@@ -146,12 +140,6 @@ class SerialComm:
         Returns:
             True if DONE received, False on ERR, timeout, or port error.
         """
-        if not SERIAL_AVAILABLE:
-            logger.info("[SIMULATED] Waiting for DONE...")
-            time.sleep(2)
-            logger.info("[SIMULATED] DONE received.")
-            return True
-
         deadline = time.time() + timeout
         with self._lock:
             if not self._serial or not self._serial.is_open:

@@ -62,7 +62,8 @@ def main():
         baud=cfg["serial_baud"],
     )
     if not serial.connect():
-        logger.warning("Serial port unavailable — continuing in simulation mode.")
+        logger.error("Failed to open serial port '%s'. Exiting.", cfg["serial_port"])
+        sys.exit(1)
 
     # Step 3: Start command poller
     poller = CommandPoller(serial=serial)
