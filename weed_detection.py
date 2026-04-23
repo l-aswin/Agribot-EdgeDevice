@@ -1,27 +1,10 @@
-"""
-weed_detection.py
------------------
-Implements the 8-step weed detection sequence that runs on the Jetson Nano.
-
-Steps:
-  1. Capture photo from USB camera.
-  2. Run YOLO model to detect weeds.
-  3. Draw bounding boxes and save annotated image.
-  4. Write detections JSON (coordinates, class label, confidence).
-  5. Upload raw image, annotated image, and JSON to server; delete local copies.
-  6. Send MOVE command to nodeMCU via serial.
-  7. Wait for POSITION_REACHED from nodeMCU.
-  8. If total distance covered → send COMPLETED; else repeat from Step 1.
-"""
-
 import json
 import logging
-import os
 import threading
 import time
-import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import cv2
 
@@ -31,284 +14,164 @@ from serial_comm import SerialComm
 
 logger = logging.getLogger(__name__)
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    logger.error("ultralytics package not installed. Install it with: pip install ultralytics")
-    sys.exit(1)
+
+@dataclass
+class WDSResult:
+    status: str            # 'completed' | 'aborted'
+    reason: Optional[str]  # 'timeout' | 'err' | 'stopped' | None
+    distance_covered: float
+    steps_taken: int
 
 
-class WeedDetectionSequence:
+def _stem_for(step_index: int) -> str:
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{ts}_{step_index}"
+
+
+def _delete_partial(stem: str, image_save_dir: Path) -> None:
+    uploader.delete_bundle(stem, image_save_dir)
+
+
+def run_wds(
+    *,
+    forward_distance_cm: float,
+    start_step_index: int,
+    job_id: str,
+    abort_flag: threading.Event,
+    serial: SerialComm,
+    yolo_model,
+    led_send: Callable[[str], None],
+) -> WDSResult:
     """
-    Runs the weed-detection sequence in a dedicated thread.
-    Can be stopped safely at any point via stop().
+    Run the Weed Detection Sequence (SR-32–SR-39).
+
+    Reads image_save_dir, pending_uploads_dir, camera_index, camera_vision_width_cm
+    from settings at call time. confidence_threshold is read fresh per YOLO inference.
     """
+    image_save_dir = Path(settings.get("image_save_dir"))
+    pending_uploads_dir = Path(settings.get("pending_uploads_dir"))
+    camera_index = settings.get("camera_index")
+    camera_vision_width_cm = settings.get("camera_vision_width_cm")
+    upload_url = settings.get("upload_url")
+    device_id = settings.get("device_id")
+    device_secret = settings.get("device_secret")
+    wds_active_flag = threading.Event()  # internal use only
 
-    def __init__(self, travel_distance_cm: float, serial: SerialComm):
-        """
-        Args:
-            travel_distance_cm: Total distance (cm) to travel while scanning.
-            serial:             Active SerialComm instance for ESP8266 communication.
-        """
-        self.travel_distance = travel_distance_cm
-        self.serial = serial
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._model = None
+    distance_covered = 0.0
+    step_index = start_step_index
 
-    # ------------------------------------------------------------------
-    # Public control API
-    # ------------------------------------------------------------------
+    while distance_covered < forward_distance_cm:
+        # SR-18a iteration-start check
+        if abort_flag.is_set():
+            return WDSResult("aborted", "stopped", distance_covered, step_index - start_step_index)
 
-    def start(self):
-        """Launch the detection sequence in a background thread."""
-        if self._thread and self._thread.is_alive():
-            logger.warning("Detection sequence already running.")
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_sequence,
-            name="WeedDetectionThread",
-            daemon=True,
-        )
-        self._thread.start()
-        logger.info("Weed detection sequence started (distance=%.1f cm).", self.travel_distance)
+        stem = _stem_for(step_index)
 
-    def stop(self):
-        """Signal the sequence to stop as soon as possible."""
-        self._stop_event.set()
-        logger.info("Stop signal sent to weed detection sequence.")
-
-    def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def join(self, timeout: float = None):
-        if self._thread:
-            self._thread.join(timeout=timeout)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _stopped(self) -> bool:
-        return self._stop_event.is_set()
-
-    def _load_model(self):
-        """Load (or reload) the YOLO model."""
-        model_path = settings.get("yolo_model_path", "yolo.pt")
-        logger.info("Loading YOLO model from %s ...", model_path)
-        try:
-            self._model = YOLO(model_path)
-            logger.info("YOLO model loaded.")
-        except Exception as e:
-            logger.error("Failed to load YOLO model from '%s': %s", model_path, e)
-            sys.exit(1)
-
-    def _ensure_save_dir(self) -> Path:
-        save_dir = Path(settings.get("image_save_dir", "/tmp/weed_captures"))
-        save_dir.mkdir(parents=True, exist_ok=True)
-        return save_dir
-
-    # ------------------------------------------------------------------
-    # Detection sequence steps
-    # ------------------------------------------------------------------
-
-    def _step1_capture(self, save_dir: Path, capture_id: str) -> Optional[str]:
-        """Step 1: Capture a photo from the USB camera."""
-        cam_index = settings.get("camera_index", 0)
-        raw_path = str(save_dir / f"{capture_id}_raw.jpg")
-
-        cap = cv2.VideoCapture(cam_index)
+        # SR-34: Capture
+        raw_path = image_save_dir / f"{stem}_raw.jpg"
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
-            logger.error("Step 1: Cannot open camera index %d.", cam_index)
-            return None
+            logger.error("SR-34: Cannot open camera %d", camera_index)
+            cap.release()
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
         ret, frame = cap.read()
         cap.release()
-        if not ret:
-            logger.error("Step 1: Failed to capture frame.")
-            return None
-        cv2.imwrite(raw_path, frame)
-        logger.info("Step 1: Image captured → %s", raw_path)
-        return raw_path
+        if not ret or frame is None or frame.size == 0:
+            logger.error("SR-34: Empty frame from camera")
+            _delete_partial(stem, image_save_dir)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
+        if not cv2.imwrite(str(raw_path), frame):
+            logger.error("SR-34: Cannot write raw image %s", raw_path)
+            _delete_partial(stem, image_save_dir)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
-    def _step2_detect(self, raw_image_path: str) -> List[dict]:
-        """Step 2: Run YOLO model and return list of detection dicts."""
-        confidence_threshold = settings.get("confidence_threshold", 0.5)
+        # SR-35: YOLO inference
+        confidence_threshold = settings.get("confidence_threshold")
+        try:
+            results = yolo_model.predict(frame, conf=confidence_threshold, verbose=False)
+        except Exception as exc:
+            logger.error("SR-35: YOLO inference failed: %s", exc)
+            _delete_partial(stem, image_save_dir)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
-        frame = cv2.imread(raw_image_path)
-        results = self._model.predict(frame, conf=confidence_threshold, verbose=False)
-        detections = []
+        detections: List[dict] = []
         for r in results:
             for box in r.boxes:
                 conf = float(box.conf[0])
-                if conf < confidence_threshold:
-                    continue
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                class_id = int(box.cls[0])
-                class_label = r.names.get(class_id, str(class_id))
+                cls_id = int(box.cls[0])
                 detections.append({
-                    "class_label": class_label,
+                    "class_label": r.names.get(cls_id, str(cls_id)),
                     "confidence": round(conf, 4),
                     "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
                 })
-        logger.info("Step 2: %d detection(s) above threshold %.2f.",
-                    len(detections), confidence_threshold)
-        return detections
 
-    def _step3_annotate(
-        self, raw_image_path: str, detections: List[dict], save_dir: Path, capture_id: str
-    ) -> str:
-        """Step 3: Draw bounding boxes and save annotated image."""
-        annotated_path = str(save_dir / f"{capture_id}_annotated.jpg")
-        frame = cv2.imread(raw_image_path)
-
+        # SR-36: Annotate and save
+        ann_path = image_save_dir / f"{stem}_annotated.jpg"
+        ann_frame = frame.copy()
         for det in detections:
-            bbox = det["bbox"]
+            b = det["bbox"]
             label = f"{det['class_label']} {det['confidence']:.2f}"
-            cv2.rectangle(
-                frame,
-                (bbox["x1"], bbox["y1"]),
-                (bbox["x2"], bbox["y2"]),
-                (0, 255, 0), 2,
-            )
-            cv2.putText(
-                frame, label,
-                (bbox["x1"], max(bbox["y1"] - 8, 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-            )
+            cv2.rectangle(ann_frame, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
+            cv2.putText(ann_frame, label, (b["x1"], max(b["y1"] - 8, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        if not cv2.imwrite(str(ann_path), ann_frame):
+            logger.error("SR-36: Cannot write annotated image %s", ann_path)
+            _delete_partial(stem, image_save_dir)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
-        cv2.imwrite(annotated_path, frame)
-        logger.info("Step 3: Annotated image saved → %s", annotated_path)
-        return annotated_path
+        # SR-37: Write JSON
+        jsn_path = image_save_dir / f"{stem}.json"
+        try:
+            jsn_path.write_text(json.dumps({
+                "job_id": job_id,
+                "step_index": step_index,
+                "detections": detections,
+            }))
+        except OSError as exc:
+            logger.error("SR-37: Cannot write JSON %s: %s", jsn_path, exc)
+            _delete_partial(stem, image_save_dir)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
-    def _step4_write_json(
-        self, detections: List[dict], save_dir: Path, capture_id: str
-    ) -> str:
-        """Step 4: Write detections to a JSON file."""
-        json_path = str(save_dir / f"{capture_id}_detections.json")
-        payload = {
-            "capture_id": capture_id,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "device_id": settings.get("device_id", "jetson-nano-01"),
-            "detections": detections,
-        }
-        with open(json_path, "w") as f:
-            json.dump(payload, f, indent=2)
-        logger.info("Step 4: Detections JSON written → %s", json_path)
-        return json_path
-
-    def _step5_upload(
-        self,
-        raw_path: str,
-        annotated_path: str,
-        json_path: str,
-        step_index: int,
-    ) -> bool:
-        """Step 5: Upload files to server and delete local copies."""
-        return uploader.upload_capture(
-            upload_url=settings.get("upload_url"),
-            raw_image_path=raw_path,
-            annotated_image_path=annotated_path,
-            detections_json_path=json_path,
-            device_id=settings.get("device_id", "jetson-nano-01"),
+        # SR-38: Upload with retry; abort-during-retry handled inside uploader
+        result = uploader.upload_bundle_with_retry(
+            stem=stem,
+            job_id=job_id,
             step_index=step_index,
+            upload_url=upload_url,
+            device_id=device_id,
+            device_secret=device_secret,
+            image_save_dir=image_save_dir,
+            pending_uploads_dir=pending_uploads_dir,
+            led_send=led_send,
+            stop_flag=abort_flag,
         )
+        if result == "stopped":
+            return WDSResult("aborted", "stopped", distance_covered, step_index - start_step_index)
 
-    def _step6_send_move(self, step_distance_cm: float) -> bool:
-        """Step 6: Send FWD command to ESP8266."""
-        logger.info("Step 6: Sending FWD %.1f cm to ESP8266.", step_distance_cm)
-        return self.serial.send_move_command("forward", step_distance_cm)
+        # SR-18a post-upload abort check
+        if abort_flag.is_set():
+            return WDSResult("aborted", "stopped", distance_covered, step_index - start_step_index)
 
-    def _step7_wait_position(self) -> bool:
-        """Step 7: Wait for ESP8266 to confirm movement complete."""
-        logger.info("Step 7: Waiting for DONE from ESP8266...")
-        reached = self.serial.wait_for_done(timeout=120.0)
-        if reached:
-            logger.info("Step 7: Movement complete.")
-        else:
-            logger.warning("Step 7: Timed out waiting for DONE.")
-        return reached
+        # SR-39: Move forward
+        move_cm = min(camera_vision_width_cm, forward_distance_cm - distance_covered)
+        serial.send(f"FWD:{move_cm:.1f}\n")
+        outcome, err_code = serial.wait_for_done_abortable(abort_flag, total_timeout=120.0)
 
-    def _step8_check_complete(
-        self, distance_covered: float
-    ) -> bool:
-        """Step 8: Return True if total travel distance is covered."""
-        return distance_covered >= self.travel_distance
+        if outcome == "abort":
+            serial.flush_input()
+            return WDSResult("aborted", "stopped", distance_covered, step_index - start_step_index)
+        if outcome == "timeout":
+            serial.send("STP\n")
+            serial.flush_input()
+            logger.error("SR-39: DONE timeout")
+            return WDSResult("aborted", "timeout", distance_covered, step_index - start_step_index)
+        if outcome == "err":
+            logger.error("SR-39: ESP ERR:%s", err_code)
+            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
-    # ------------------------------------------------------------------
-    # Main sequence loop
-    # ------------------------------------------------------------------
+        # outcome == 'done'
+        distance_covered += move_cm
+        step_index += 1
 
-    def _run_sequence(self):
-        self._load_model()
-
-        save_dir = self._ensure_save_dir()
-        step_distance = float(settings.get("camera_vision_width_cm", 50.0))
-        distance_covered = 0.0
-        step_index = 0
-
-        while not self._stopped():
-            step_index += 1
-            capture_id = uuid.uuid4().hex[:12]
-            logger.info("=== Sequence step %d | covered=%.1f/%.1f cm ===",
-                        step_index, distance_covered, self.travel_distance)
-
-            # Step 1 – Capture
-            if self._stopped():
-                break
-            raw_path = self._step1_capture(save_dir, capture_id)
-            if raw_path is None:
-                logger.error("Step 1 failed. Aborting sequence.")
-                break
-
-            # Step 2 – Detect
-            if self._stopped():
-                break
-            detections = self._step2_detect(raw_path)
-
-            # Step 3 – Annotate
-            if self._stopped():
-                break
-            annotated_path = self._step3_annotate(raw_path, detections, save_dir, capture_id)
-
-            # Step 4 – Write JSON
-            if self._stopped():
-                break
-            json_path = self._step4_write_json(detections, save_dir, capture_id)
-
-            # Step 5 – Upload
-            if self._stopped():
-                break
-            if not self._step5_upload(raw_path, annotated_path, json_path, step_index):
-                logger.warning("Step 5: Upload failed. Continuing sequence.")
-
-            # Step 6 – Move
-            if self._stopped():
-                break
-            remaining = self.travel_distance - distance_covered
-            move_dist = min(step_distance, remaining)
-            if not self._step6_send_move(move_dist):
-                logger.error("Step 6 failed. Aborting sequence.")
-                break
-
-            # Step 7 – Wait for position
-            if self._stopped():
-                break
-            if not self._step7_wait_position():
-                logger.error("Step 7: Position not reached. Aborting sequence.")
-                break
-
-            distance_covered += move_dist
-
-            # Step 8 – Check completion
-            if self._step8_check_complete(distance_covered):
-                logger.info("Step 8: Total distance covered (%.1f cm). Sending COMPLETED.",
-                            distance_covered)
-                uploader.send_completed(
-                    completed_url=settings.get("completed_url"),
-                    device_id=settings.get("device_id", "jetson-nano-01"),
-                    total_distance=distance_covered,
-                )
-                break
-
-        logger.info("Weed detection sequence finished (stopped=%s).", self._stopped())
+    return WDSResult("completed", None, distance_covered, step_index - start_step_index)

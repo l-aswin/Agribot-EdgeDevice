@@ -1,84 +1,44 @@
-"""
-settings.py
------------
-Manages loading and saving device settings from/to a local JSON file.
-"""
-
 import json
-import logging
 import threading
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+_lock = threading.Lock()
+_cfg: dict = {}
+_config_path: Path = Path("config.json")
 
-DEFAULT_SETTINGS = {
-    "confidence_threshold": 0.5,
-    "api_url": "http://192.168.1.100:5000",
-    "command_poll_url": "http://192.168.1.100:5000/api/command",
-    "upload_url": "http://192.168.1.100:5000/api/upload",
-    "completed_url": "http://192.168.1.100:5000/api/completed",
-    "serial_port": "/dev/ttyUSB0",
-    "serial_baud": 115200,
-    "camera_index": 0,
-    "yolo_model_path": "yolo.pt",
-    "image_save_dir": "/tmp/weed_captures",
-    "device_id": "jetson-nano-01"
-}
+REQUIRED_KEYS = [
+    "device_id", "device_secret", "api_url", "command_poll_url", "upload_url",
+    "completed_url", "settings_update_status_url", "device_state_url",
+    "history_upload_completed_url", "serial_port", "serial_baud_rate",
+    "camera_index", "camera_vision_width_cm", "yolo_model_path",
+    "image_save_dir", "pending_uploads_dir", "confidence_threshold",
+]
 
-SETTINGS_FILE = Path("config.json")
-
-# Global lock for thread-safe access
-_settings_lock = threading.Lock()
-_settings: dict = {}
+UPDATABLE_KEYS = {"confidence_threshold", "camera_vision_width_cm"}
 
 
-def load_settings() -> dict:
-    """Load settings from JSON file. Falls back to defaults if file is missing."""
-    global _settings
-    with _settings_lock:
-        if SETTINGS_FILE.exists():
-            try:
-                with open(SETTINGS_FILE, "r") as f:
-                    loaded = json.load(f)
-                _settings = {**DEFAULT_SETTINGS, **loaded}
-                logger.info("Settings loaded from %s", SETTINGS_FILE)
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning("Failed to read settings file: %s. Using defaults.", e)
-                _settings = dict(DEFAULT_SETTINGS)
-        else:
-            logger.info("No settings file found. Creating default config.")
-            _settings = dict(DEFAULT_SETTINGS)
-            _save_locked()
-        return dict(_settings)
+def init(cfg: dict, config_path: Path) -> None:
+    global _config_path
+    with _lock:
+        _cfg.clear()
+        _cfg.update(cfg)
+        _config_path = config_path
 
 
-def get(key: str, default=None):
-    """Thread-safe getter for a single setting value."""
-    with _settings_lock:
-        return _settings.get(key, default)
+def get(key: str):
+    with _lock:
+        return _cfg[key]
 
 
-def update_settings(new_values: dict) -> bool:
-    """Update one or more settings values and persist to JSON file."""
-    global _settings
-    with _settings_lock:
-        _settings.update(new_values)
-        return _save_locked()
-
-
-def _save_locked() -> bool:
-    """Write current settings to JSON (must be called while holding _settings_lock)."""
-    try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(_settings, f, indent=2)
-        logger.info("Settings saved to %s", SETTINGS_FILE)
+def update_fields(fields: dict) -> bool:
+    """Write fields to disk first, then apply to memory. Returns True on success."""
+    with _lock:
+        updated = {**_cfg, **fields}
+        try:
+            tmp = _config_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(updated, indent=2))
+            tmp.replace(_config_path)
+        except OSError:
+            return False
+        _cfg.update(fields)
         return True
-    except IOError as e:
-        logger.error("Failed to save settings: %s", e)
-        return False
-
-
-def all_settings() -> dict:
-    """Return a copy of the current settings dict."""
-    with _settings_lock:
-        return dict(_settings)

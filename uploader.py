@@ -1,114 +1,124 @@
-"""
-uploader.py
------------
-Handles HTTP file uploads (raw image, bounding-box image, detections JSON)
-and completion notification to the web server.
-"""
-
-import json
 import logging
-import os
+import shutil
+import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-UPLOAD_TIMEOUT = 30  # seconds per file upload
+UPLOAD_TIMEOUT = 30
 
 
-def upload_capture(
-    upload_url: str,
-    raw_image_path: str,
-    annotated_image_path: str,
-    detections_json_path: str,
-    device_id: str = "jetson-nano-01",
-    step_index: int = 0,
-) -> bool:
-    """
-    Upload raw image, annotated image, and detections JSON to the server.
-    Deletes local copies on success.
-
-    Args:
-        upload_url:             Server endpoint for multipart upload.
-        raw_image_path:         Path to the original camera image.
-        annotated_image_path:   Path to the bounding-box overlay image.
-        detections_json_path:   Path to the detections JSON file.
-        device_id:              Device identifier sent as form field.
-        step_index:             Sequence step number for traceability.
-
-    Returns:
-        True if upload succeeded, False otherwise.
-    """
-    files_to_upload = {
-        "raw_image":        raw_image_path,
-        "annotated_image":  annotated_image_path,
-        "detections_json":  detections_json_path,
-    }
-
-    # Verify all files exist before attempting upload
-    for key, path in files_to_upload.items():
-        if not Path(path).exists():
-            logger.error("Upload file missing [%s]: %s", key, path)
-            return False
-
+def post_json(url: str, payload: dict, timeout: int = 10) -> Optional[requests.Response]:
+    """POST JSON; returns Response or None on network/timeout failure."""
     try:
-        with (
-            open(raw_image_path, "rb") as raw_f,
-            open(annotated_image_path, "rb") as ann_f,
-            open(detections_json_path, "rb") as det_f,
-        ):
-            files = {
-                "raw_image":       (os.path.basename(raw_image_path),       raw_f,  "image/jpeg"),
-                "annotated_image": (os.path.basename(annotated_image_path), ann_f,  "image/jpeg"),
-                "detections":      (os.path.basename(detections_json_path), det_f,  "application/json"),
-            }
-            data = {"device_id": device_id, "step_index": step_index}
+        return requests.post(url, json=payload, timeout=timeout)
+    except requests.RequestException as exc:
+        logger.error("POST %s failed: %s", url, exc)
+        return None
 
-            logger.info("Uploading capture (step %d) to %s ...", step_index, upload_url)
-            resp = requests.post(upload_url, files=files, data=data, timeout=UPLOAD_TIMEOUT)
-            resp.raise_for_status()
-            logger.info("Upload successful (HTTP %d).", resp.status_code)
 
-    except requests.RequestException as e:
-        logger.error("Upload failed: %s", e)
-        return False
+def move_to_pending(stem: str, image_save_dir: Path, pending_uploads_dir: Path) -> None:
+    for suffix in ("_raw.jpg", "_annotated.jpg", ".json"):
+        src = image_save_dir / f"{stem}{suffix}"
+        if src.exists():
+            shutil.move(str(src), pending_uploads_dir / src.name)
 
-    # Delete local copies after successful upload
-    for path in files_to_upload.values():
+
+def delete_bundle(stem: str, image_save_dir: Path) -> None:
+    for suffix in ("_raw.jpg", "_annotated.jpg", ".json"):
+        f = image_save_dir / f"{stem}{suffix}"
         try:
-            os.remove(path)
-            logger.debug("Deleted local file: %s", path)
-        except OSError as e:
-            logger.warning("Could not delete %s: %s", path, e)
-
-    return True
+            f.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Cannot delete %s: %s", f, exc)
 
 
-def send_completed(completed_url: str, device_id: str, total_distance: float) -> bool:
-    """
-    Notify the server that the full travel distance has been covered.
-
-    Args:
-        completed_url:   Server endpoint for completion notification.
-        device_id:       Device identifier.
-        total_distance:  Total travel distance in meters.
-
-    Returns:
-        True if the notification was acknowledged, False otherwise.
-    """
-    payload = {
-        "device_id":      device_id,
-        "status":         "completed",
-        "total_distance": total_distance,
-    }
+def _upload_bundle_raw(
+    stem: str,
+    job_id: str,
+    step_index: int,
+    upload_url: str,
+    device_id: str,
+    device_secret: str,
+    image_save_dir: Path,
+) -> Optional[requests.Response]:
+    """Multipart POST for one bundle. Returns Response or None on failure."""
+    raw = image_save_dir / f"{stem}_raw.jpg"
+    ann = image_save_dir / f"{stem}_annotated.jpg"
+    jsn = image_save_dir / f"{stem}.json"
     try:
-        logger.info("Sending COMPLETED notification to %s ...", completed_url)
-        resp = requests.post(completed_url, json=payload, timeout=10)
-        resp.raise_for_status()
-        logger.info("COMPLETED notification accepted (HTTP %d).", resp.status_code)
-        return True
-    except requests.RequestException as e:
-        logger.error("Failed to send COMPLETED notification: %s", e)
-        return False
+        with open(raw, "rb") as rf, open(ann, "rb") as af, open(jsn, "rb") as jf:
+            files = {
+                "raw_image": (raw.name, rf, "image/jpeg"),
+                "annotated_image": (ann.name, af, "image/jpeg"),
+                "detections": (jsn.name, jf, "application/json"),
+            }
+            data = {
+                "device_id": device_id,
+                "device_secret": device_secret,
+                "job_id": job_id,
+                "step_index": str(step_index),
+            }
+            return requests.post(upload_url, files=files, data=data, timeout=UPLOAD_TIMEOUT)
+    except requests.RequestException as exc:
+        logger.error("Upload network error for stem %s: %s", stem, exc)
+        return None
+    except OSError as exc:
+        logger.error("Cannot open bundle files for stem %s: %s", stem, exc)
+        return None
+
+
+def upload_bundle_with_retry(
+    stem: str,
+    job_id: str,
+    step_index: int,
+    upload_url: str,
+    device_id: str,
+    device_secret: str,
+    image_save_dir: Path,
+    pending_uploads_dir: Path,
+    led_send: Callable[[str], None],
+    stop_flag: Optional[threading.Event] = None,
+) -> str:
+    """
+    Upload bundle; retry once on non-401 failure with 5-second interruptible wait.
+
+    Returns one of: 'success', 'auth_fail', 'moved', 'stopped'
+        'success'   — uploaded; local files deleted
+        'auth_fail' — 401; files moved to pending
+        'moved'     — both attempts failed; files moved to pending
+        'stopped'   — stop_flag set during retry wait; files moved to pending
+    """
+    resp = _upload_bundle_raw(stem, job_id, step_index, upload_url, device_id, device_secret, image_save_dir)
+
+    if resp is not None and resp.status_code == 200:
+        delete_bundle(stem, image_save_dir)
+        return "success"
+
+    if resp is not None and resp.status_code == 401:
+        logger.error("Auth fail (401) uploading %s", stem)
+        led_send("LED:AUTH_FAIL\n")
+        move_to_pending(stem, image_save_dir, pending_uploads_dir)
+        return "auth_fail"
+
+    # Non-401 failure: wait 5 s, checking stop_flag every 2 s
+    logger.warning("Upload failed for stem %s; retrying after 5 s", stem)
+    wait_end = time.monotonic() + 5.0
+    while time.monotonic() < wait_end:
+        if stop_flag and stop_flag.is_set():
+            move_to_pending(stem, image_save_dir, pending_uploads_dir)
+            return "stopped"
+        remaining = wait_end - time.monotonic()
+        time.sleep(min(2.0, max(0.0, remaining)))
+
+    resp2 = _upload_bundle_raw(stem, job_id, step_index, upload_url, device_id, device_secret, image_save_dir)
+    if resp2 is not None and resp2.status_code == 200:
+        delete_bundle(stem, image_save_dir)
+        return "success"
+
+    move_to_pending(stem, image_save_dir, pending_uploads_dir)
+    return "moved"
