@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 import cv2
-import numpy
 import requests
 
 import settings
@@ -138,10 +137,16 @@ def main() -> None:
             time.sleep(10)
             continue
 
+        startup_img_path = Path(settings.get("image_save_dir")) / "startup_test.jpg"
+        cv2.imwrite(str(startup_img_path), frame)
+        logger.info("Startup test frame saved to %s", startup_img_path)
+
         # SR-11: YOLO self-test
         try:
             yolo_model = YOLO(settings.get("yolo_model_path"))
-            yolo_model.predict(numpy.zeros((640, 640, 3), dtype=numpy.uint8), verbose=False)
+            results = yolo_model.predict(frame, conf=settings.get("confidence_threshold"), verbose=False)
+            det_count = sum(len(r.boxes) for r in results)
+            logger.info("Startup YOLO test: %d detection(s) on startup frame", det_count)
         except Exception as exc:
             logger.error("Startup error code 7: YOLO self-test failed: %s — retrying in 10 s", exc)
             time.sleep(10)
@@ -190,6 +195,15 @@ def main() -> None:
         poll_thread = poller.get_thread()
         if poll_thread and poll_thread.is_alive():
             poll_thread.join(timeout=6)
+        # Step 6.5: notify backend of graceful shutdown (best-effort)
+        try:
+            requests.post(
+                settings.get("base_api_url") + "/disconnect",
+                json={"device_id": settings.get("device_id"), "device_secret": settings.get("device_secret")},
+                timeout=3,
+            )
+        except Exception:
+            pass
         # Step 7
         serial.flush_and_close()
         logger.info("Shutdown complete. Log: %s", _log_filename)

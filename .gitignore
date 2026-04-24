@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# captured images
+images/
+weed_captures/
+pending_uploads/
