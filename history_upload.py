@@ -18,11 +18,11 @@ def run_history_upload(
 ) -> None:
     """SR-49–SR-52: History Data Upload handler (runs in handler thread)."""
     pending_dir = Path(settings.get("pending_uploads_dir"))
-    upload_url = settings.get("upload_url")
+    upload_url = settings.url("upload_url")
     device_id = settings.get("device_id")
     device_secret = settings.get("device_secret")
-    history_url = settings.get("history_upload_completed_url")
-    state_url = settings.get("device_state_url")
+    history_url = settings.url("history_upload_completed_url")
+    state_url = settings.url("device_state_url")
 
     # Discover bundles by .json files; stem is the shared filename base
     json_files = sorted(pending_dir.glob("*.json"))
@@ -124,3 +124,5 @@ def run_history_upload(
         {"device_id": device_id, "device_secret": device_secret, "state": "idle"},
         timeout=10,
     )
+
+    led_send("LED:VEHICLE_IDLE\n")

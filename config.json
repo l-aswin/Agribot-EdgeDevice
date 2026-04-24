@@ -1,14 +1,19 @@
 {
   "confidence_threshold": 0.5,
   "camera_vision_width_cm": 50,
-  "api_url": "http://192.168.1.100:5000",
-  "command_poll_url": "http://192.168.1.100:5000/api/command",
-  "upload_url": "http://192.168.1.100:5000/api/upload",
-  "completed_url": "http://192.168.1.100:5000/api/completed",
+  "base_api_url": "http://192.168.29.102:5000/api/iot_device",
+  "command_poll_url": "/command",
+  "upload_url": "/upload",
+  "completed_url": "/completed",
+  "settings_update_status_url": "/settings/status",
+  "device_state_url": "/device/state",
+  "history_upload_completed_url": "/history/completed",
   "serial_port": "/dev/ttyUSB0",
-  "serial_baud": 115200,
+  "serial_baud_rate": 115200,
   "camera_index": 0,
-  "yolo_model_path": "yolo.pt",
-  "image_save_dir": "/tmp/weed_captures",
-  "device_id": "jetson-nano-01"
+  "yolo_model_path": "./model/GhostBottleneck-YOLOv11n-CBAM.pt",
+  "image_save_dir": "./weed_captures",
+  "pending_uploads_dir": "./pending_uploads",
+  "device_id": "jetson-nano-01",
+  "device_secret": "CHANGE_ME"
 }

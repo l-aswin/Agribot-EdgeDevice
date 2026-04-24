@@ -7,7 +7,7 @@ _cfg: dict = {}
 _config_path: Path = Path("config.json")
 
 REQUIRED_KEYS = [
-    "device_id", "device_secret", "api_url", "command_poll_url", "upload_url",
+    "device_id", "device_secret", "base_api_url", "command_poll_url", "upload_url",
     "completed_url", "settings_update_status_url", "device_state_url",
     "history_upload_completed_url", "serial_port", "serial_baud_rate",
     "camera_index", "camera_vision_width_cm", "yolo_model_path",
@@ -28,6 +28,12 @@ def init(cfg: dict, config_path: Path) -> None:
 def get(key: str):
     with _lock:
         return _cfg[key]
+
+
+def url(endpoint_key: str) -> str:
+    """Return base_api_url + the endpoint path stored under endpoint_key."""
+    with _lock:
+        return _cfg["base_api_url"] + _cfg[endpoint_key]
 
 
 def update_fields(fields: dict) -> bool:

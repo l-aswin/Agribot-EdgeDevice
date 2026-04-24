@@ -31,18 +31,17 @@ The startup sequence runs once at boot before the command polling loop begins. C
 - **SR-02:** The device SHALL check for `config.json` in the working directory. If the file does not exist, the device SHALL exit with **error code 1**.
 - **SR-03:** If `config.json` exists but cannot be parsed as valid JSON, the device SHALL exit with **error code 2**.
 - **SR-04:** The device SHALL validate that all required keys are present in the loaded config:
-  `device_id`, `device_secret`, `api_url`, `command_poll_url`, `upload_url`, `completed_url`, `settings_update_status_url`, `device_state_url`, `history_upload_completed_url`, `serial_port`, `serial_baud_rate`, `camera_index`, `camera_vision_width_cm`, `yolo_model_path`, `image_save_dir`, `pending_uploads_dir`, `confidence_threshold`.
+  `device_id`, `device_secret`, `base_api_url`, `command_poll_url`, `upload_url`, `completed_url`, `settings_update_status_url`, `device_state_url`, `history_upload_completed_url`, `serial_port`, `serial_baud_rate`, `camera_index`, `camera_vision_width_cm`, `yolo_model_path`, `image_save_dir`, `pending_uploads_dir`, `confidence_threshold`.
+  All endpoint keys (`command_poll_url`, `upload_url`, `completed_url`, `settings_update_status_url`, `device_state_url`, `history_upload_completed_url`) store only the path portion (e.g. `/command`). The device SHALL construct the full URL for every request as `base_api_url + endpoint_path` (e.g. `http://host/api` + `/command` → `http://host/api/command`).
   The device SHALL check all required keys are present as a bulk operation before proceeding to value validation (SR-04b). If any key is missing, the device SHALL exit with **error code 3**. Because this is a bulk check, all keys that are present (including `serial_port`, if present) are accessible at this point and SHALL be used by SR-05 for the error-code-3 LED send.
   > `device_id` and `device_secret` are operator-supplied and have no safe defaults. If either is absent or an empty string, the device SHALL exit with **error code 3** and log a message instructing the operator to populate these values in `config.json`.
 - **SR-04a:** Camera vision width (cm) defines the ground distance covered by one camera frame. This value SHALL be used as the step distance — the robot moves exactly this distance after each image capture before taking the next picture, ensuring full field coverage with no gaps or overlaps.
 - **SR-04b:** Only after SR-04's bulk key-presence check passes, the device SHALL validate values: `confidence_threshold` must be a float in the range `[0.0, 1.0]` and `camera_vision_width_cm` must be a strictly positive integer. If either value fails validation, the device SHALL exit with **error code 3** and log which key holds an invalid value. At this stage all config keys including `serial_port` have already been loaded, so SR-05's error-code-3 port selection always uses the configured `serial_port`.
-- **SR-05:** On error codes 1–3, the device SHALL attempt to send `LED:ERR:{code}\n` via serial before exiting, using the port determined as follows:
-  - **Error code 1** (`config.json` missing): no config was loaded — always use the hard-coded fallback port `/dev/ttyUSB0`.
-  - **Error code 2** (`config.json` not valid JSON): the file could not be parsed so no keys are available — always use `/dev/ttyUSB0`.
-  - **Error code 3** (key missing, value invalid, or directory creation failure): all present keys including `serial_port` were loaded during SR-04's bulk check (see SR-04/SR-04b), so the device SHALL always use the configured `serial_port`; fall back to `/dev/ttyUSB0` only if `serial_port` itself was the missing key.
-
-  After the LED send attempt (successful or not), the device SHALL write the error log and exit.
-- **SR-05a:** On error codes 5–7, the device SHALL send `LED:ERR:{code}\n` via the already-open serial port, then write the error log and exit.
+- **SR-05:** On error codes 1–3, the device SHALL write the error log and exit. No LED command is sent — the hardware has no LED mapping for configuration errors.
+- **SR-05a:** On error codes 5–7, the device SHALL send a LED command via the already-open serial port, log the error, wait 10 seconds, and retry the failing check and all subsequent startup checks (SR-09 → SR-10 → SR-11) in order. The device SHALL keep retrying indefinitely until all three checks pass:
+  - **Error code 5** (server unreachable): send `LED:SERVER_UNREACHABLE\n`, wait 10 s, restart from SR-09.
+  - **Error code 6** (camera failed): send `LED:CAMERA_FAIL\n`, wait 10 s, restart from SR-09.
+  - **Error code 7** (YOLO model failed): no LED command is sent — the hardware has no LED mapping for model errors; log only, wait 10 s, restart from SR-09.
 - **SR-06:** Configuration values SHALL be loaded into in-memory variables for runtime use. The device SHALL create `image_save_dir` and `pending_uploads_dir` if either does not exist. If either directory cannot be created, the device SHALL log the error and exit with **error code 3**.
 
 ### Step 2 — Open Serial Port
@@ -52,7 +51,7 @@ The startup sequence runs once at boot before the command polling loop begins. C
 
 ### Step 3 — Verify Server Connection
 
-- **SR-09:** The device SHALL send `GET {api_url}/devicecheck` with `device_id` and `device_secret` as URL query parameters. If the response is not HTTP 200 within 5 seconds, exit with **error code 5**. Note: all runtime requests use POST with a JSON or multipart body, except the route fetch (SR-27a) which also uses GET with query parameters.
+- **SR-09:** The device SHALL send `GET {base_api_url}/devicecheck` with `device_id` and `device_secret` as URL query parameters. If the response is not HTTP 200 within 5 seconds — including HTTP 404 (endpoint not found), any other non-200 status, network error, or timeout — the device SHALL exit with **error code 5** and send `LED:SERVER_UNREACHABLE\n`. Note: all runtime requests use POST with a JSON or multipart body, except the route fetch (SR-27a) which also uses GET with query parameters.
 
 ### Step 4 — Camera Self-Test
 
@@ -64,7 +63,7 @@ The startup sequence runs once at boot before the command polling loop begins. C
 
 ### Step 6 — Signal Ready
 
-- **SR-12:** On passing all checks, the device SHALL send `LED:STARTUP_OK\n` via serial, then start the command polling background thread and block the main thread until SIGINT or SIGTERM. On receiving SIGINT or SIGTERM, the device SHALL perform the following shutdown sequence in order:
+- **SR-12:** On passing all checks, the device SHALL send `LED:STARTUP_OK\n` via serial followed immediately by `LED:VEHICLE_IDLE\n` to initialise the vehicle status LED, then start the command polling background thread and block the main thread until SIGINT or SIGTERM. On receiving SIGINT or SIGTERM, the device SHALL perform the following shutdown sequence in order:
   1. Set the abort flag (the same flag used by the `stop` command) to signal any active handler thread to stop.
   2. Set a separate polling-stop event to signal the polling thread to exit its loop after the current poll cycle.
   3. Send `STP\n` to the ESP8266 via serial.
@@ -81,9 +80,9 @@ The startup sequence runs once at boot before the command polling loop begins. C
 | 2 | Settings | `config.json` is not valid JSON |
 | 3 | Settings | One or more required config keys are missing, empty, or hold an invalid value; or a required working directory could not be created |
 | 4 | Serial | Port failed to open, or ESP8266 did not respond to `PING` |
-| 5 | Server | `/api/devicecheck` did not return HTTP 200 within 5 s |
-| 6 | Camera | Camera failed to open or returned an empty frame |
-| 7 | YOLO | Model failed to load or inference threw an exception |
+| 5 | Server | `/api/devicecheck` did not return HTTP 200 within 5 s — retried every 10 s |
+| 6 | Camera | Camera failed to open or returned an empty frame — retried every 10 s |
+| 7 | YOLO | Model failed to load or inference threw an exception — retried every 10 s |
 
 ---
 
@@ -99,7 +98,7 @@ The startup sequence runs once at boot before the command polling loop begins. C
   6. `"stop"`, `"start_pending_upload"`, and `"stop_pending_upload"` require no payload.
 - **SR-14:** Polling SHALL run in a background thread independently of any active operation. The polling loop SHALL check the polling-stop event at the start of each cycle before sending the poll request; if the event is set, the loop SHALL exit immediately without sending a new poll request.
 - **SR-15:** The device SHALL handle the following commands: `start`, `stop`, `update`, `start_pending_upload`, `stop_pending_upload`.
-- **SR-15a:** If a poll request fails (network error or timeout), the device SHALL log the error, send `LED:CONNECTIVITY_ERR\n` via serial, and resume polling on the next 2-second cycle. Poll failures SHALL NOT affect any in-progress operation. When a poll request receives any HTTP response after one or more connectivity failures, the device SHALL send `LED:CONNECTIVITY_OK\n` via serial before processing the response (including before sending `LED:AUTH_FAIL\n` on a 401). A 401 response SHALL be treated as a successful network connection for connectivity-tracking purposes.
+- **SR-15a:** If a poll request fails (network error or timeout), the device SHALL log the error, send `LED:SERVER_UNREACHABLE\n` via serial, and resume polling on the next 2-second cycle. Poll failures SHALL NOT affect any in-progress operation. When a poll request returns HTTP 200 after one or more consecutive poll failures, the device SHALL send `LED:CLEAR_ERROR_LED\n` via serial before processing the response.
 - **SR-15b:** No upload attempt is made during normal polling; pending files are uploaded only when a `start_pending_upload` command is received (Section 4a).
 - **SR-15c:** Command gating rules by device state:
   - **Idle:** all commands are processed normally.
@@ -138,7 +137,7 @@ The startup sequence runs once at boot before the command polling loop begins. C
 - **SR-51:** On normal completion (all bundles processed) or early exit via `stop_pending_upload`, the device SHALL:
   1. POST to `history_upload_completed_url` with `{"device_id": "<device_id>", "device_secret": "<device_secret>", "succeeded": <count>, "failed": <count>}` (10-second timeout; not retried). If the request fails, times out, or receives a non-200/non-401 response, the device SHALL log the error. If the server responds with HTTP 401, the device SHALL log the error and send `LED:AUTH_FAIL\n` via serial.
   2. POST to `device_state_url` with `{"device_id": "<device_id>", "device_secret": "<device_secret>", "state": "idle"}` (10-second timeout; not retried; failure is logged).
-  3. Return to idle/polling state.
+  3. Send `LED:VEHICLE_IDLE\n` via serial and return to idle/polling state.
 - **SR-52:** If `start_pending_upload` is received while idle but `pending_uploads_dir` contains no bundles, the device SHALL still POST the entry state (`state: "pending_upload"`) to `device_state_url`, immediately send the completion POST with `"succeeded": 0` and `"failed": 0`, then POST `state: "idle"` and return to idle.
 
 ---
@@ -151,13 +150,13 @@ The startup sequence runs once at boot before the command polling loop begins. C
   2. **Iteration-start check:** The WDS loop SHALL check the abort flag at the top of each iteration (before SR-34). If set, the loop SHALL abort with reason `stopped` and return to the mode handler.
   3. **Post-upload check:** The WDS loop SHALL also check the abort flag between SR-38 and SR-39. If set, no additional file handling is required — SR-38 will have already deleted or moved all iteration files before returning. The loop SHALL abort with reason `stopped`.
   4. **Retry-wait check:** During the 5-second SR-38 retry wait, the device SHALL check the abort flag every 2 seconds. If the abort flag is set during this wait, the device SHALL move all three iteration files to `pending_uploads_dir` (preserving detection data) and abort the WDS with reason `stopped`.
-- **SR-19:** The device SHALL return to idle/polling state after stopping. If no operation is in progress when `stop` is received, the device SHALL log the event and remain in idle/polling state. A `stop` command received during History Data Upload Mode SHALL be logged and ignored; use `stop_pending_upload` to exit that mode early.
+- **SR-19:** The device SHALL send `LED:VEHICLE_IDLE\n` via serial and return to idle/polling state after stopping. If no operation is in progress when `stop` is received, the device SHALL log the event and remain in idle/polling state. A `stop` command received during History Data Upload Mode SHALL be logged and ignored; use `stop_pending_upload` to exit that mode early.
 
 ---
 
 ## 6. Start Command — 3 Operation Modes
 
-- **SR-20:** The `start` command payload SHALL include a `mode` field indicating the operation mode: `"A"` for Manual Control, `"B"` for One-Way Weed Detection, `"C"` for Route-Based Weed Detection. The device SHALL dispatch to the corresponding handler based on this field. An unrecognised `mode` value SHALL be logged and ignored.
+- **SR-20:** The `start` command payload SHALL include a `mode` field indicating the operation mode: `"A"` for Manual Control, `"B"` for One-Way Weed Detection, `"C"` for Route-Based Weed Detection. The device SHALL send `LED:VEHICLE_WORKING\n` via serial and then dispatch to the corresponding handler based on this field. An unrecognised `mode` value SHALL be logged and ignored (no LED is sent for an unrecognised mode).
 
 ### Mode A: Manual Control
 
@@ -171,20 +170,20 @@ The startup sequence runs once at boot before the command polling loop begins. C
 
 - **SR-24:** The `start` command for this mode SHALL include parameters: `job_id` (unique identifier for this detection job assigned by the web server) and `travel_distance_cm` (total forward distance in centimetres). No `device_state_url` notification is sent at Mode B start — the server tracks job liveness via the job-creation timestamp and the final completion POST (SR-26).
 - **SR-25:** The device SHALL pass `travel_distance_cm` to the Weed Detection Sequence (Section 7) as `forward_distance_cm` and `start_step_index = 0` in a single call; the WDS handles iteration internally until the full distance is covered.
-- **SR-26:** On completion, the device SHALL send a `POST` request to `completed_url` with JSON body: `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "completed", "total_distance_cm": <distance_covered>}`. If the Weed Detection Sequence aborted, the device SHALL instead send `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "aborted", "reason": "<timeout|err|stopped>", "total_distance_cm": <distance_covered>}`. The completion POST request SHALL time out after 10 seconds. If the request fails, times out, or receives a non-200/non-401 response, the device SHALL log the error and return to idle/polling state. If the server responds with HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, and return to idle/polling state. The completion notification is not retried; the server must reconcile job status through other means.
+- **SR-26:** On completion, the device SHALL send a `POST` request to `completed_url` with JSON body: `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "completed", "total_distance_cm": <distance_covered>}`. If the Weed Detection Sequence aborted, the device SHALL instead send `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "aborted", "reason": "<timeout|err|stopped>", "total_distance_cm": <distance_covered>}`. The completion POST request SHALL time out after 10 seconds. If the request fails, times out, or receives a non-200/non-401 response, the device SHALL log the error, send `LED:VEHICLE_IDLE\n` via serial, and return to idle/polling state. If the server responds with HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, send `LED:VEHICLE_IDLE\n` via serial, and return to idle/polling state. The completion notification is not retried; the server must reconcile job status through other means.
 
 ### Mode C: Route-Based Weed Detection
 
 > **Status: Planned — not yet implemented.**
 
 - **SR-27:** The `start` command for this mode SHALL include parameters: `job_id` (unique identifier for this detection job assigned by the web server) and a `route_name` referencing a pre-saved route on the server. No `device_state_url` notification is sent at Mode C start — the server tracks job liveness via the job-creation timestamp and the final completion POST (SR-31).
-- **SR-27a:** After receiving the `start` command, the device SHALL send a `GET` request to `{api_url}/route` with `route_name`, `device_id`, and `device_secret` as URL query parameters and expect a JSON response with a `"steps"` key containing the ordered list of route steps. The request SHALL time out after 5 seconds. If the request returns HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, and send the `aborted` completion POST (SR-31) with reason `err`. For all other failures (network error, timeout, or non-200/non-401 response), the device SHALL log the error and send the `aborted` completion POST (SR-31) with reason `err`. If the HTTP 200 response body cannot be parsed as JSON or does not contain a valid ordered list of route steps, the device SHALL log the error and send the `aborted` completion POST (SR-31) with reason `err`. In all failure cases the aborted completion POST SHALL use `total_distance_cm: 0`, since no route steps have been executed.
+- **SR-27a:** After receiving the `start` command, the device SHALL send a `GET` request to `{base_api_url}/route` with `route_name`, `device_id`, and `device_secret` as URL query parameters and expect a JSON response with a `"steps"` key containing the ordered list of route steps. The request SHALL time out after 5 seconds. If the request returns HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, and send the `aborted` completion POST (SR-31) with reason `err`. For all other failures (network error, timeout, or non-200/non-401 response), the device SHALL log the error and send the `aborted` completion POST (SR-31) with reason `err`. If the HTTP 200 response body cannot be parsed as JSON or does not contain a valid ordered list of route steps, the device SHALL log the error and send the `aborted` completion POST (SR-31) with reason `err`. In all failure cases the aborted completion POST SHALL use `total_distance_cm: 0`, since no route steps have been executed.
 - **SR-28:** A route SHALL be an ordered list of steps, each with a `type` field (`"forward"`, `"turn_left"`, or `"turn_right"`), and a `value` field (distance in cm for forward steps; angle in degrees for turn steps).
 - **SR-28a:** Before iterating route steps, the device SHALL initialise `total_distance_covered = 0` and `cumulative_step_index = 0`.
 - **SR-28b:** For each step in the route in order: if `type` is `"forward"`, apply SR-29; if `type` is `"turn_left"` or `"turn_right"`, apply SR-30. If a step's `type` is unrecognised, the device SHALL log a warning and skip that step.
 - **SR-29:** For each forward segment in the route, the device SHALL pass the segment's distance value as `forward_distance_cm` and the current `cumulative_step_index` as `start_step_index` to the Weed Detection Sequence (Section 7). After the WDS call returns, the device SHALL accumulate the returned `distance_covered` into `total_distance_covered` and add the returned `steps_taken` count to `cumulative_step_index`, then advance to the next route step. This ensures `step_index` values are globally unique across all forward segments of the same job. If the WDS returns status `aborted`, the device SHALL accumulate the partial `distance_covered` and `steps_taken` before ceasing further route steps, and shall proceed to the aborted branch of SR-31 with the WDS's abort reason.
 - **SR-30:** Turn commands SHALL be sent directly to ESP8266 via UART without weed detection: `TLT:{value:.1f}\n` for `turn_left` steps and `TRT:{value:.1f}\n` for `turn_right` steps. The device SHALL wait for `DONE\n` (timeout: 120 s), checking the abort flag every 2 seconds during the wait. On timeout, the device SHALL send `STP\n`, flush the serial input buffer to discard the ESP's subsequent `DONE\n`, log the error, and abort the route with status `aborted` and reason `timeout`. If `ERR:{code}\n` is received, the device SHALL log the error and abort the route with status `aborted` and reason `err`. If the abort flag is set during the wait (`STP\n` already transmitted by the polling thread per SR-18a), the device SHALL flush the serial input buffer to discard the incoming `DONE\n` and abort the route with status `aborted` and reason `stopped`. In all abort cases the device SHALL proceed to send the `aborted` completion POST (SR-31).
-- **SR-31:** On completing all route steps, the device SHALL send a `POST` request to `completed_url` with JSON body: `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "completed", "total_distance_cm": <total_distance_covered>}`. If any route step (WDS call or turn command) aborted, the device SHALL stop processing further route steps and instead send `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "aborted", "reason": "<timeout|err|stopped>", "total_distance_cm": <total_distance_covered>}`. The completion POST request SHALL time out after 10 seconds. If the request fails, times out, or receives a non-200/non-401 response, the device SHALL log the error and return to idle/polling state. If the server responds with HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, and return to idle/polling state. The completion notification is not retried; the server must reconcile job status through other means.
+- **SR-31:** On completing all route steps, the device SHALL send a `POST` request to `completed_url` with JSON body: `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "completed", "total_distance_cm": <total_distance_covered>}`. If any route step (WDS call or turn command) aborted, the device SHALL stop processing further route steps and instead send `{"job_id": "<job_id>", "device_id": "<device_id>", "device_secret": "<device_secret>", "status": "aborted", "reason": "<timeout|err|stopped>", "total_distance_cm": <total_distance_covered>}`. The completion POST request SHALL time out after 10 seconds. If the request fails, times out, or receives a non-200/non-401 response, the device SHALL log the error, send `LED:VEHICLE_IDLE\n` via serial, and return to idle/polling state. If the server responds with HTTP 401 or a body indicating unknown device or wrong secret, the device SHALL log the authentication error, send `LED:AUTH_FAIL\n` via serial, send `LED:VEHICLE_IDLE\n` via serial, and return to idle/polling state. The completion notification is not retried; the server must reconcile job status through other means.
 
 ---
 
@@ -282,12 +281,12 @@ flowchart TD
 |-------|---------|
 | `LED:STARTUP_INPROGRESS\n` | Startup checks are running |
 | `LED:STARTUP_OK\n` | All startup checks passed |
-| `LED:ERR:1\n`, `LED:ERR:2\n`, `LED:ERR:3\n` | Startup failed at the corresponding settings error code stage (sent via fallback port `/dev/ttyUSB0` per SR-05) |
-| `LED:ERR:4\n` | *(Never sent — serial port unavailable at this stage; only a log file is produced — see SR-07)* |
-| `LED:ERR:5\n`, `LED:ERR:6\n`, `LED:ERR:7\n` | Startup failed at the corresponding error code stage (sent via the already-open serial port per SR-05a) |
-| `LED:CONNECTIVITY_ERR\n` | Server poll request failed (network error or timeout) |
-| `LED:CONNECTIVITY_OK\n` | Server connectivity restored after one or more poll failures |
+| `LED:SERVER_UNREACHABLE\n` | Startup failed — server did not return HTTP 200 (error code 5); or a runtime poll request failed (network error or timeout) |
+| `LED:CLEAR_ERROR_LED\n` | Poll request returned HTTP 200 after one or more consecutive poll failures — clears the server unreachable error LED |
+| `LED:CAMERA_FAIL\n` | Startup failed — camera failed to open or returned an empty frame (error code 6) |
 | `LED:AUTH_FAIL\n` | Server rejected request — unknown device or wrong secret |
+| `LED:VEHICLE_IDLE\n` | Vehicle is idle — no active job |
+| `LED:VEHICLE_WORKING\n` | Vehicle is executing a job (Mode A, B, or C) |
 | `LED:SHUTDOWN\n` | Device process is terminating (SIGINT/SIGTERM received) |
 
 - **SR-42:** The Jetson Nano SHALL wait for `DONE\n` after sending each movement command, with a maximum timeout of 120 seconds; during a WDS the wait SHALL be implemented as specified in SR-39 (abort-flag-checked loop with serial flush on both abort and timeout). If the timeout expires, the device SHALL send `STP\n` and treat the operation as failed. If an `ACK\n` frame is received before `DONE\n`, the device SHALL discard it and continue waiting for `DONE\n`. If an `ERR:{code}\n` frame is received during an active WDS, the device SHALL log the error code, abort the current sequence and return to the mode handler with status `aborted` and reason `err`. Outside an active WDS, the device SHALL log the error code and handle it per the applicable context: in Mode A, return to idle/polling state; in Mode C turn commands, abort the route per SR-30.

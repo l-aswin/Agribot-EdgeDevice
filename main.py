@@ -19,7 +19,7 @@ from serial_comm import SerialComm
 # ---------------------------------------------------------------------------
 _logs_dir = Path("logs")
 _logs_dir.mkdir(exist_ok=True)
-_log_filename = _logs_dir / time.strftime("%d-%b-%Y_%I-%M-%S%p").lower().replace(" ", "") + ".log"
+_log_filename = _logs_dir / (time.strftime("%d-%b-%Y_%I-%M-%S%p").lower().replace(" ", "") + ".log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,23 +35,8 @@ logger = logging.getLogger("main")
 # Helpers
 # ---------------------------------------------------------------------------
 
-_FALLBACK_PORT = "/dev/ttyUSB0"
-
-
-def _try_send_led(port: str, baud: int, code: int) -> None:
-    """Best-effort LED:ERR send; never raises."""
-    try:
-        import serial as _serial
-        with _serial.Serial(port, baud, timeout=2) as s:
-            s.write(f"LED:ERR:{code}\n".encode())
-    except Exception as exc:
-        logger.warning("Could not send LED:ERR:%d via %s: %s", code, port, exc)
-
-
-def _exit_with_error(code: int, message: str, led_port: str, baud: int = 115200) -> None:
+def _exit_with_error(code: int, message: str) -> None:
     logger.error("Startup error code %d: %s", code, message)
-    if code <= 3:
-        _try_send_led(led_port, baud, code)
     logger.info("Log written to %s", _log_filename)
     sys.exit(code)
 
@@ -66,25 +51,23 @@ def main() -> None:
     # SR-02: config.json existence
     config_path = Path("config.json")
     if not config_path.exists():
-        _exit_with_error(1, "config.json not found", _FALLBACK_PORT)
+        _exit_with_error(1, "config.json not found")
 
     # SR-03: JSON parse
     try:
         raw_cfg = json.loads(config_path.read_text())
     except json.JSONDecodeError as exc:
-        _exit_with_error(2, f"config.json is not valid JSON: {exc}", _FALLBACK_PORT)
+        _exit_with_error(2, f"config.json is not valid JSON: {exc}")
 
     # SR-04: bulk key-presence check (before value validation)
     missing = [k for k in settings.REQUIRED_KEYS if k not in raw_cfg]
     if missing:
-        led_port = raw_cfg.get("serial_port", _FALLBACK_PORT)
-        _exit_with_error(3, f"Missing config keys: {missing}", led_port)
+        _exit_with_error(3, f"Missing config keys: {missing}")
 
     # SR-04: device_id / device_secret must not be empty strings
     for key in ("device_id", "device_secret"):
         if not raw_cfg[key]:
-            led_port = raw_cfg.get("serial_port", _FALLBACK_PORT)
-            _exit_with_error(3, f"Config key '{key}' must not be empty", led_port)
+            _exit_with_error(3, f"Config key '{key}' must not be empty — populate it in config.json")
 
     # SR-04b: value validation (serial_port always available now)
     led_port = raw_cfg["serial_port"]
@@ -92,10 +75,10 @@ def main() -> None:
 
     if not isinstance(raw_cfg["confidence_threshold"], (int, float)) or \
             not (0.0 <= float(raw_cfg["confidence_threshold"]) <= 1.0):
-        _exit_with_error(3, "confidence_threshold must be a float in [0.0, 1.0]", led_port, baud)
+        _exit_with_error(3, "confidence_threshold must be a float in [0.0, 1.0]")
 
     if not isinstance(raw_cfg["camera_vision_width_cm"], int) or raw_cfg["camera_vision_width_cm"] <= 0:
-        _exit_with_error(3, "camera_vision_width_cm must be a strictly positive integer", led_port, baud)
+        _exit_with_error(3, "camera_vision_width_cm must be a strictly positive integer")
 
     # SR-06: create required directories
     for dir_key in ("image_save_dir", "pending_uploads_dir"):
@@ -103,7 +86,7 @@ def main() -> None:
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            _exit_with_error(3, f"Cannot create {dir_key} ({d}): {exc}", led_port, baud)
+            _exit_with_error(3, f"Cannot create {dir_key} ({d}): {exc}")
 
     # Initialise settings module
     settings.init(raw_cfg, config_path)
@@ -122,49 +105,53 @@ def main() -> None:
     serial.flush_input()
     if not serial.ping(timeout=3.0):
         logger.error("Startup error code 4: ESP8266 did not respond to PING")
-        led_send("LED:ERR:4\n")  # SR-05a equivalent — port is open
         serial.flush_and_close()
         sys.exit(4)
     led_send("LED:STARTUP_INPROGRESS\n")
 
-    # SR-09: server connectivity check
-    try:
-        r = requests.get(
-            f"{settings.get('api_url')}/devicecheck",
-            params={"device_id": settings.get("device_id"), "device_secret": settings.get("device_secret")},
-            timeout=5,
-        )
-        if r.status_code != 200:
-            raise ValueError(f"HTTP {r.status_code}")
-    except Exception as exc:
-        logger.error("Startup error code 5: server check failed: %s", exc)
-        led_send("LED:ERR:5\n")
-        serial.flush_and_close()
-        sys.exit(5)
+    # SR-09–SR-11: retry loop — checks repeat every 10 s until all pass
+    from ultralytics import YOLO
+    yolo_model = None
+    while True:
+        # SR-09: server connectivity check
+        try:
+            r = requests.get(
+                settings.get("base_api_url") + "/devicecheck",
+                params={"device_id": settings.get("device_id"), "device_secret": settings.get("device_secret")},
+                timeout=5,
+            )
+            if r.status_code != 200:
+                raise ValueError(f"HTTP {r.status_code}")
+        except Exception as exc:
+            logger.error("Startup error code 5: server check failed: %s — retrying in 10 s", exc)
+            led_send("LED:SERVER_UNREACHABLE\n")
+            time.sleep(10)
+            continue
 
-    # SR-10: camera self-test
-    cam = cv2.VideoCapture(settings.get("camera_index"))
-    ret, frame = cam.read()
-    cam.release()
-    if not ret or frame is None or frame.size == 0:
-        logger.error("Startup error code 6: camera self-test failed")
-        led_send("LED:ERR:6\n")
-        serial.flush_and_close()
-        sys.exit(6)
+        # SR-10: camera self-test
+        cam = cv2.VideoCapture(settings.get("camera_index"))
+        ret, frame = cam.read()
+        cam.release()
+        if not ret or frame is None or frame.size == 0:
+            logger.error("Startup error code 6: camera self-test failed — retrying in 10 s")
+            led_send("LED:CAMERA_FAIL\n")
+            time.sleep(10)
+            continue
 
-    # SR-11: YOLO self-test
-    try:
-        from ultralytics import YOLO
-        yolo_model = YOLO(settings.get("yolo_model_path"))
-        yolo_model.predict(numpy.zeros((640, 640, 3), dtype=numpy.uint8), verbose=False)
-    except Exception as exc:
-        logger.error("Startup error code 7: YOLO self-test failed: %s", exc)
-        led_send("LED:ERR:7\n")
-        serial.flush_and_close()
-        sys.exit(7)
+        # SR-11: YOLO self-test
+        try:
+            yolo_model = YOLO(settings.get("yolo_model_path"))
+            yolo_model.predict(numpy.zeros((640, 640, 3), dtype=numpy.uint8), verbose=False)
+        except Exception as exc:
+            logger.error("Startup error code 7: YOLO self-test failed: %s — retrying in 10 s", exc)
+            time.sleep(10)
+            continue
+
+        break  # all checks passed
 
     # SR-12: signal ready
     led_send("LED:STARTUP_OK\n")
+    led_send("LED:VEHICLE_IDLE\n")
     logger.info("All startup checks passed; entering polling loop")
 
     abort_flag = threading.Event()

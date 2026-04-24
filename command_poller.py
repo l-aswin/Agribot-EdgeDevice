@@ -76,7 +76,7 @@ class CommandPoller:
             self._polling_stop_event.wait(timeout=POLL_INTERVAL)
 
     def _poll_once(self) -> None:
-        url = settings.get("command_poll_url")
+        url = settings.url("command_poll_url")
         device_id = settings.get("device_id")
         device_secret = settings.get("device_secret")
 
@@ -88,13 +88,13 @@ class CommandPoller:
             )
         except requests.RequestException as exc:
             logger.error("Poll request failed: %s", exc)
-            self._led_send("LED:CONNECTIVITY_ERR\n")
+            self._led_send("LED:SERVER_UNREACHABLE\n")
             self._had_connectivity_failure = True
             return
 
         # Connectivity restored
         if self._had_connectivity_failure:
-            self._led_send("LED:CONNECTIVITY_OK\n")
+            self._led_send("LED:CLEAR_ERROR_LED\n")
             self._had_connectivity_failure = False
 
         if resp.status_code == 401:
@@ -165,6 +165,12 @@ class CommandPoller:
     # ------------------------------------------------------------------
 
     def _handle_stop(self) -> None:
+        with self._state_lock:
+            state = self._state
+        if state == STATE_IDLE:
+            logger.info("Stop received while idle; ignored")
+            self._led_send("LED:VEHICLE_IDLE\n")
+            return
         # SR-18a: send STP first, then set abort_flag
         self._serial.send("STP\n")
         self._abort_flag.set()
@@ -204,7 +210,7 @@ class CommandPoller:
         # SR-17: determine status and write
         device_id = settings.get("device_id")
         device_secret = settings.get("device_secret")
-        status_url = settings.get("settings_update_status_url")
+        status_url = settings.url("settings_update_status_url")
 
         if not applied:
             body = {
@@ -259,6 +265,8 @@ class CommandPoller:
             logger.info("Mode C: planned — not yet implemented")
             return
 
+        self._led_send("LED:VEHICLE_WORKING\n")
+
         # Mode B
         job_id = payload.get("job_id")
         travel_distance_cm = payload.get("travel_distance_cm")
@@ -292,7 +300,7 @@ class CommandPoller:
     def _handle_start_pending_upload(self) -> None:
         device_id = settings.get("device_id")
         device_secret = settings.get("device_secret")
-        state_url = settings.get("device_state_url")
+        state_url = settings.url("device_state_url")
 
         # SR-49 step 1: POST state = pending_upload (not retried)
         uploader.post_json(

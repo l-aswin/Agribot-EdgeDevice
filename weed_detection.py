@@ -52,10 +52,9 @@ def run_wds(
     pending_uploads_dir = Path(settings.get("pending_uploads_dir"))
     camera_index = settings.get("camera_index")
     camera_vision_width_cm = settings.get("camera_vision_width_cm")
-    upload_url = settings.get("upload_url")
+    upload_url = settings.url("upload_url")
     device_id = settings.get("device_id")
     device_secret = settings.get("device_secret")
-    wds_active_flag = threading.Event()  # internal use only
 
     distance_covered = 0.0
     step_index = start_step_index

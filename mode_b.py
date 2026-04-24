@@ -38,7 +38,7 @@ def run_mode_b(
     # SR-26: completion POST
     device_id = settings.get("device_id")
     device_secret = settings.get("device_secret")
-    completed_url = settings.get("completed_url")
+    completed_url = settings.url("completed_url")
 
     if result.status == "completed":
         payload = {
@@ -66,3 +66,5 @@ def run_mode_b(
         led_send("LED:AUTH_FAIL\n")
     elif resp.status_code != 200:
         logger.error("Mode B: completion POST HTTP %d", resp.status_code)
+
+    led_send("LED:VEHICLE_IDLE\n")
