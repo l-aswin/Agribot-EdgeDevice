@@ -11,7 +11,9 @@ from serial_comm import SerialComm
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 2.0
+POLL_INTERVAL = 5.0
+MAX_POLL_INTERVAL = 60.0
+BACKOFF_FACTOR = 2
 
 STATE_IDLE = "idle"
 STATE_ACTIVE = "active"
@@ -48,6 +50,8 @@ class CommandPoller:
         self._stop_pending_upload_flag = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
         self._had_connectivity_failure = False
+        self._consecutive_failures = 0
+        self._current_poll_interval = POLL_INTERVAL
 
     def start(self) -> None:
         self._poll_thread = threading.Thread(
@@ -73,7 +77,7 @@ class CommandPoller:
             self._poll_once()
 
             # Wait for next cycle, but exit early if stop event set
-            self._polling_stop_event.wait(timeout=POLL_INTERVAL)
+            self._polling_stop_event.wait(timeout=self._current_poll_interval)
 
     def _poll_once(self) -> None:
         url = settings.url("command_poll_url")
@@ -87,15 +91,21 @@ class CommandPoller:
                 timeout=5,
             )
         except requests.RequestException as exc:
-            logger.error("Poll request failed: %s", exc)
+            self._consecutive_failures += 1
+            if self._consecutive_failures == 1 or self._consecutive_failures % 10 == 0:
+                logger.error("Poll request failed (%d consecutive): %s", self._consecutive_failures, exc)
             self._led_send("LED:SERVER_UNREACHABLE\n")
             self._had_connectivity_failure = True
+            self._current_poll_interval = min(self._current_poll_interval * BACKOFF_FACTOR, MAX_POLL_INTERVAL)
             return
 
         # Connectivity restored
         if self._had_connectivity_failure:
+            logger.info("Poll connectivity restored after %d failures", self._consecutive_failures)
             self._led_send("LED:CLEAR_ERROR_LED\n")
             self._had_connectivity_failure = False
+            self._consecutive_failures = 0
+            self._current_poll_interval = POLL_INTERVAL
 
         if resp.status_code == 401:
             logger.error("Poll auth fail (401)")
@@ -123,6 +133,7 @@ class CommandPoller:
             logger.warning("Command %r missing/invalid payload; ignored", command)
             return
 
+        logger.info("Command received: %r payload=%r", command, data.get("payload"))
         self._dispatch(command, data.get("payload", {}))
 
     # ------------------------------------------------------------------
@@ -165,6 +176,7 @@ class CommandPoller:
     # ------------------------------------------------------------------
 
     def _handle_stop(self) -> None:
+        logger.info("Processing stop command")
         with self._state_lock:
             state = self._state
         if state == STATE_IDLE:
@@ -172,12 +184,15 @@ class CommandPoller:
             self._led_send("LED:VEHICLE_IDLE\n")
             return
         # SR-18a: send STP first, then set abort_flag
+        logger.info("Stop: sending STP to serial")
         self._serial.send("STP\n")
+        logger.info("Stop: setting abort flag")
         self._abort_flag.set()
-        logger.info("Stop: STP sent, abort_flag set")
+        logger.info("Stop: complete")
 
     def _handle_update(self, payload: dict) -> None:
         """SR-16a + SR-17."""
+        logger.info("Processing update command: fields=%r", list(payload.keys()))
         applied = {}
         blocked = []
 
@@ -193,6 +208,7 @@ class CommandPoller:
                     logger.warning("Update: invalid confidence_threshold %r", value)
                     blocked.append({"field": field, "reason": "validation_error"})
                     continue
+                logger.info("Update: validated confidence_threshold=%s", value)
                 applied[field] = float(value)
 
             elif field == "camera_vision_width_cm":
@@ -205,8 +221,10 @@ class CommandPoller:
                     logger.warning("Update: camera_vision_width_cm blocked (WDS active)")
                     blocked.append({"field": field, "reason": "wds_active"})
                     continue
+                logger.info("Update: validated camera_vision_width_cm=%s", value)
                 applied[field] = value
 
+        logger.info("Update: applied=%r blocked=%r", list(applied.keys()), blocked)
         # SR-17: determine status and write
         device_id = settings.get("device_id")
         device_secret = settings.get("device_secret")
@@ -243,6 +261,7 @@ class CommandPoller:
                     "status": "success",
                 }
 
+        logger.info("Update: posting status=%r to server", body.get("status"))
         resp = uploader.post_json(status_url, body, timeout=5)
         if resp is None:
             logger.error("Update status POST failed (network)")
@@ -251,8 +270,11 @@ class CommandPoller:
             self._led_send("LED:AUTH_FAIL\n")
         elif resp.status_code != 200:
             logger.error("Update status POST HTTP %d", resp.status_code)
+        else:
+            logger.info("Update: complete")
 
     def _handle_start(self, payload: dict) -> None:
+        logger.info("Processing start command: payload=%r", payload)
         mode = payload.get("mode")
         if mode not in ("A", "B", "C"):
             logger.warning("Start: unrecognised mode %r; ignored", mode)
@@ -265,6 +287,7 @@ class CommandPoller:
             logger.info("Mode C: planned — not yet implemented")
             return
 
+        logger.info("Start: mode B selected, setting LED to VEHICLE_WORKING")
         self._led_send("LED:VEHICLE_WORKING\n")
 
         # Mode B
@@ -274,12 +297,17 @@ class CommandPoller:
             logger.warning("Start Mode B: missing job_id or travel_distance_cm")
             return
 
+        logger.info("Start Mode B: job_id=%r travel_distance_cm=%s", job_id, travel_distance_cm)
+        logger.info("Start Mode B: clearing abort flag, setting state to active")
         self._abort_flag.clear()
         self._set_state(STATE_ACTIVE)
 
         from mode_b import run_mode_b
 
+        logger.info("Start Mode B: launching handler thread")
+
         def _handler():
+            logger.info("Mode B handler started")
             try:
                 run_mode_b(
                     job_id=str(job_id),
@@ -291,45 +319,56 @@ class CommandPoller:
                     wds_active_flag=self._wds_active_flag,
                 )
             finally:
+                logger.info("Mode B handler finished, resetting state to idle")
                 self._set_state(STATE_IDLE)
 
         t = threading.Thread(target=_handler, name="ModeBHandler", daemon=True)
         self._handler_thread_ref[0] = t
         t.start()
+        logger.info("Start Mode B: handler thread started")
 
     def _handle_start_pending_upload(self) -> None:
+        logger.info("Processing start_pending_upload command")
         device_id = settings.get("device_id")
         device_secret = settings.get("device_secret")
         state_url = settings.url("device_state_url")
 
         # SR-49 step 1: POST state = pending_upload (not retried)
+        logger.info("start_pending_upload: posting state=pending_upload to server")
         uploader.post_json(
             state_url,
             {"device_id": device_id, "device_secret": device_secret, "state": "pending_upload"},
             timeout=10,
         )
 
+        logger.info("start_pending_upload: clearing stop flag, setting state to history")
         self._stop_pending_upload_flag.clear()
         self._set_state(STATE_HISTORY)
 
         from history_upload import run_history_upload
 
+        logger.info("start_pending_upload: launching history upload thread")
+
         def _handler():
+            logger.info("History upload handler started")
             try:
                 run_history_upload(
                     stop_flag=self._stop_pending_upload_flag,
                     led_send=self._led_send,
                 )
             finally:
+                logger.info("History upload handler finished, resetting state to idle")
                 self._set_state(STATE_IDLE)
 
         t = threading.Thread(target=_handler, name="HistoryUploadHandler", daemon=True)
         self._handler_thread_ref[0] = t
         t.start()
+        logger.info("start_pending_upload: handler thread started")
 
     def _handle_stop_pending_upload(self) -> None:
+        logger.info("Processing stop_pending_upload command")
         self._stop_pending_upload_flag.set()
-        logger.info("stop_pending_upload: flag set")
+        logger.info("stop_pending_upload: stop flag set, upload will halt")
 
     # ------------------------------------------------------------------
     # State helpers
