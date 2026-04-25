@@ -51,56 +51,34 @@ def run_history_upload(
             failed += 1
             continue
 
-        # Upload from pending_dir (treat it as image_save_dir for this call)
-        resp = uploader._upload_bundle_raw(
+        # SR-50: Upload from pending_dir with retry logic from the uploader module.
+        # We set move_on_final_fail=False because the files are already in the
+        # pending directory; on failure, they should just stay there.
+        result = uploader.upload_bundle_with_retry(
             stem=stem,
             job_id=job_id,
             step_index=step_index,
             upload_url=upload_url,
             device_id=device_id,
             device_secret=device_secret,
-            image_save_dir=pending_dir,
+            image_save_dir=pending_dir,  # Source directory
+            pending_uploads_dir=pending_dir,  # Not used, but required by signature
+            led_send=led_send,
+            stop_flag=stop_flag,
+            move_on_final_fail=False,
         )
 
-        if resp is not None and resp.status_code == 200:
-            uploader.delete_bundle(stem, pending_dir)
+        if result == "success":
             succeeded += 1
-            if stop_flag.is_set():
-                break
-            continue
-
-        if resp is not None and resp.status_code == 401:
-            logger.error("History upload auth fail (401) for stem %s", stem)
-            led_send("LED:AUTH_FAIL\n")
+        elif result == "auth_fail":
+            # The uploader function already logs the error and sends the LED signal.
             failed += 1
-            if stop_flag.is_set():
-                break
-            continue
-
-        # Non-401 failure: retry after 5 s, checking stop_flag every 2 s
-        logger.warning("History upload failed for stem %s; retrying after 5 s", stem)
-        wait_end = time.monotonic() + 5.0
-        while time.monotonic() < wait_end:
-            if stop_flag.is_set():
-                failed += 1
-                break
-            remaining = wait_end - time.monotonic()
-            time.sleep(min(2.0, max(0.0, remaining)))
-        else:
-            resp2 = uploader._upload_bundle_raw(
-                stem=stem,
-                job_id=job_id,
-                step_index=step_index,
-                upload_url=upload_url,
-                device_id=device_id,
-                device_secret=device_secret,
-                image_save_dir=pending_dir,
-            )
-            if resp2 is not None and resp2.status_code == 200:
-                uploader.delete_bundle(stem, pending_dir)
-                succeeded += 1
-            else:
-                failed += 1
+        elif result == "moved":  # This status now means "final failure" for us.
+            logger.warning("History upload for stem %s failed after retry, file remains in pending.", stem)
+            failed += 1
+        elif result == "stopped":
+            logger.info("History upload stopped during retry wait for stem %s.", stem)
+            failed += 1
 
         if stop_flag.is_set():
             break

@@ -50,20 +50,30 @@ def _upload_bundle_raw(
     raw = image_save_dir / f"{stem}_raw.jpg"
     ann = image_save_dir / f"{stem}_annotated.jpg"
     jsn = image_save_dir / f"{stem}.json"
+
+    data = {
+        "device_id": device_id,
+        "device_secret": device_secret,
+        "job_id": job_id,
+        "step_index": str(step_index),
+    }
+
     try:
-        with open(raw, "rb") as rf, open(ann, "rb") as af, open(jsn, "rb") as jf:
-            files = {
-                "raw_image": (raw.name, rf, "image/jpeg"),
-                "annotated_image": (ann.name, af, "image/jpeg"),
-                "detections": (jsn.name, jf, "application/json"),
-            }
-            data = {
-                "device_id": device_id,
-                "device_secret": device_secret,
-                "job_id": job_id,
-                "step_index": str(step_index),
-            }
-            return requests.post(upload_url, files=files, data=data, timeout=UPLOAD_TIMEOUT)
+        if ann.exists():
+            with open(raw, "rb") as rf, open(ann, "rb") as af, open(jsn, "rb") as jf:
+                files = {
+                    "raw_image": (raw.name, rf, "image/jpeg"),
+                    "annotated_image": (ann.name, af, "image/jpeg"),
+                    "detections": (jsn.name, jf, "application/json"),
+                }
+                return requests.post(upload_url, files=files, data=data, timeout=UPLOAD_TIMEOUT)
+        else:
+            with open(raw, "rb") as rf, open(jsn, "rb") as jf:
+                files = {
+                    "raw_image": (raw.name, rf, "image/jpeg"),
+                    "detections": (jsn.name, jf, "application/json"),
+                }
+                return requests.post(upload_url, files=files, data=data, timeout=UPLOAD_TIMEOUT)
     except requests.RequestException as exc:
         logger.error("Upload network error for stem %s: %s", stem, exc)
         return None
@@ -83,6 +93,7 @@ def upload_bundle_with_retry(
     pending_uploads_dir: Path,
     led_send: Callable[[str], None],
     stop_flag: Optional[threading.Event] = None,
+    move_on_final_fail: bool = True,
 ) -> str:
     """
     Upload bundle; retry once on non-401 failure with 5-second interruptible wait.
@@ -120,5 +131,6 @@ def upload_bundle_with_retry(
         delete_bundle(stem, image_save_dir)
         return "success"
 
-    move_to_pending(stem, image_save_dir, pending_uploads_dir)
+    if move_on_final_fail:
+        move_to_pending(stem, image_save_dir, pending_uploads_dir)
     return "moved"

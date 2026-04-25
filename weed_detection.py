@@ -106,18 +106,19 @@ def run_wds(
                 })
 
         # SR-36: Annotate and save
-        ann_path = image_save_dir / f"{stem}_annotated.jpg"
-        ann_frame = frame.copy()
-        for det in detections:
-            b = det["bbox"]
-            label = f"{det['class_label']} {det['confidence']:.2f}"
-            cv2.rectangle(ann_frame, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
-            cv2.putText(ann_frame, label, (b["x1"], max(b["y1"] - 8, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        if not cv2.imwrite(str(ann_path), ann_frame):
-            logger.error("SR-36: Cannot write annotated image %s", ann_path)
-            _delete_partial(stem, image_save_dir)
-            return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
+        if detections:
+            ann_path = image_save_dir / f"{stem}_annotated.jpg"
+            ann_frame = frame.copy()
+            for det in detections:
+                b = det["bbox"]
+                label = f"{det['class_label']} {det['confidence']:.2f}"
+                cv2.rectangle(ann_frame, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
+                cv2.putText(ann_frame, label, (b["x1"], max(b["y1"] - 8, 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            if not cv2.imwrite(str(ann_path), ann_frame):
+                logger.error("SR-36: Cannot write annotated image %s", ann_path)
+                _delete_partial(stem, image_save_dir)
+                return WDSResult("aborted", "err", distance_covered, step_index - start_step_index)
 
         # SR-37: Write JSON
         jsn_path = image_save_dir / f"{stem}.json"
