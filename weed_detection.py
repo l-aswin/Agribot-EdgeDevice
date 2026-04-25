@@ -155,8 +155,19 @@ def run_wds(
 
         # SR-39: Move forward
         move_cm = min(camera_vision_width_cm, forward_distance_cm - distance_covered)
-        serial.send(f"FWD:{move_cm:.1f}\n")
+        fwd_frame = f"FWD:{move_cm:.1f}\n"
+        serial.send(fwd_frame)
         outcome, err_code = serial.wait_for_done_abortable(abort_flag, total_timeout=120.0)
+
+        if outcome == "err" and err_code == "2":
+            # ESP busy with a previous movement — stop it, then retry once
+            logger.warning("SR-39: ESP busy (ERR:2), sending STP and retrying")
+            serial.send("STP\n")
+            stop_outcome, _ = serial.wait_for_done_abortable(abort_flag, total_timeout=30.0)
+            if stop_outcome not in ("done", "abort"):
+                serial.flush_input()
+            serial.send(fwd_frame)
+            outcome, err_code = serial.wait_for_done_abortable(abort_flag, total_timeout=120.0)
 
         if outcome == "abort":
             serial.flush_input()

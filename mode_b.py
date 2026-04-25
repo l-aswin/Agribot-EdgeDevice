@@ -21,6 +21,7 @@ def run_mode_b(
     wds_active_flag: threading.Event,
 ) -> None:
     """SR-24–SR-26: One-Way Weed Detection handler (runs in handler thread)."""
+    logger.info("Mode B: starting WDS job_id=%s distance=%.1f cm", job_id, travel_distance_cm)
     wds_active_flag.set()
     try:
         result = run_wds(
@@ -34,6 +35,14 @@ def run_mode_b(
         )
     finally:
         wds_active_flag.clear()
+
+    logger.info(
+        "Mode B: WDS finished status=%s reason=%s distance_covered=%.1f cm steps=%d",
+        result.status,
+        result.reason,
+        result.distance_covered,
+        result.steps_completed,
+    )
 
     # SR-26: completion POST
     device_id = settings.get("device_id")
@@ -58,6 +67,7 @@ def run_mode_b(
             "total_distance_cm": result.distance_covered,
         }
 
+    logger.info("Mode B: posting completion to %s payload=%s", completed_url, payload)
     resp = uploader.post_json(completed_url, payload, timeout=10)
     if resp is None:
         logger.error("Mode B: completion POST failed (network)")
@@ -66,5 +76,8 @@ def run_mode_b(
         led_send("LED:AUTH_FAIL\n")
     elif resp.status_code != 200:
         logger.error("Mode B: completion POST HTTP %d", resp.status_code)
+    else:
+        logger.info("Mode B: completion POST OK (200)")
 
+    logger.info("Mode B: setting LED to VEHICLE_IDLE")
     led_send("LED:VEHICLE_IDLE\n")
