@@ -42,7 +42,7 @@ class SerialComm:
             try:
                 self._serial.write(frame.encode())
                 self._serial.flush()
-                logger.debug("TX: %s", frame.rstrip())
+                logger.info("TX: %s", frame.rstrip())
                 return True
             except serial.SerialException as exc:
                 logger.error("Serial write error: %s", exc)

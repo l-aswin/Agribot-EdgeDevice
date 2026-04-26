@@ -41,7 +41,7 @@ def run_mode_b(
         result.status,
         result.reason,
         result.distance_covered,
-        result.steps_completed,
+        result.steps_taken,
     )
 
     # SR-26: completion POST
